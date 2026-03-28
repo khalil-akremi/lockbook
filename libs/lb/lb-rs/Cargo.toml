@@ -59,7 +59,7 @@ tracing-logcat = "=0.1.0"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = [ "async_tokio" ] }
-indicatif = "=0.17.0-rc.11"
+indicatif = "0.17.11"
 itertools = "0.10.1"
 variant_count = "1.1.0"
 num_cpus = "1.13.0"

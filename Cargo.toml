@@ -20,6 +20,12 @@ members = [
     "libs/lb/lb-java", "libs/content/egui_wgpu_renderer",
 ]
 
+[patch.crates-io]
+esaxx-rs = { path = "third_party/esaxx-rs" }
+
+[profile.dev]
+debug = 0
+
 # restore for big binaries but good backtraces
 # [profile.release]
 # debug = true
