@@ -284,8 +284,8 @@ async fn search(query: &str) -> CliResult<()> {
     const PARENT_CHARS: usize = 2048;
     const CHILD_OVERLAP: usize = 51;
     const PARENT_OVERLAP: usize = 205;
-    const TOP_K: usize = 5;           // final results shown to user
-    const RERANK_K: usize = 50;       // candidates passed to reranker
+    const TOP_K: usize = 5;
+    const RERANK_K: usize = 50;
     const MAX_CHUNKS_PER_FILE: usize = 5000;
     const BATCH_SIZE: usize = 32;
     const RERANKER_MAX_LEN: usize = 512;
@@ -297,17 +297,14 @@ async fn search(query: &str) -> CliResult<()> {
         .join("lb-search")
         .join("models");
 
-    // Bi-encoder (E5) paths
     let bi_dir = cache_dir.join("e5-base-v2");
     let model_path = bi_dir.join("model.onnx");
     let tokenizer_path = bi_dir.join("tokenizer.json");
 
-    // Reranker (MiniLM cross-encoder) paths
     let reranker_dir = cache_dir.join("ms-marco-MiniLM-L-6-v2");
     let reranker_model_path = reranker_dir.join("model.onnx");
     let reranker_tokenizer_path = reranker_dir.join("tokenizer.json");
 
-    // Index lives next to where you run the CLI
     let index_dir = Path::new("search_index");
     let vectors_path = index_dir.join("vectors.bin");
     let chunks_path = index_dir.join("chunks.json");
@@ -369,7 +366,6 @@ async fn search(query: &str) -> CliResult<()> {
     }
 
     let current_paths: HashSet<&str> = current_files.iter().map(|(p, _, _)| p.as_str()).collect();
-
     let has_deletions = manifest.keys().any(|p| !current_paths.contains(p.as_str()));
 
     let index_exists = vectors_path.exists() && chunks_path.exists();
@@ -534,10 +530,13 @@ async fn search(query: &str) -> CliResult<()> {
                 }
             }
 
+            // ── CHANGE: file name chunk now includes first 200 chars of content
+            // so the reranker has real context when this chunk wins bi-encoder stage
+            let file_intro: String = content.chars().take(200).collect();
             new_chunks.push(ChunkRecord {
                 file_path: file_path.clone(),
                 file_name: file_name.clone(),
-                parent_chunk: file_name.clone(),
+                parent_chunk: format!("{}\n{}", file_name, file_intro),
                 child_text: file_name.clone(),
             });
 
@@ -637,7 +636,7 @@ async fn search(query: &str) -> CliResult<()> {
     }
     println!("  ✓ Loaded {} chunks", num_chunks);
 
-    // ── Step 6: Embed query ───────────────────────────────────────────────────
+    // ── Step 6: Embed query (original — E5 handles keywords well) ─────────────
     println!("🔎 Searching...");
 
     let query_vec = embed_single(
@@ -648,6 +647,14 @@ async fn search(query: &str) -> CliResult<()> {
         BI_HIDDEN,
         BI_MAX_LEN,
     )?;
+
+    // ── Step 6b: Expand query for reranker ────────────────────────────────────
+    // bi-encoder uses original query — E5 handles short keywords fine
+    // reranker uses expanded query — MiniLM needs richer natural language signal
+    let expanded_query = expand_query(query);
+    if expanded_query != query {
+        println!("  ↳ Expanded: \"{}\"", expanded_query.dimmed());
+    }
 
     // ── Step 7: Bi-encoder scoring — retrieve top RERANK_K candidates ─────────
     let mut scores: Vec<(usize, f32)> = (0..num_chunks)
@@ -662,31 +669,30 @@ async fn search(query: &str) -> CliResult<()> {
 
     scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Collect top RERANK_K unique chunks (one per file is NOT enforced here —
-    // we want diversity of chunks for the reranker to judge)
     let candidates: Vec<(usize, f32)> = scores.into_iter().take(RERANK_K).collect();
 
     // ── Step 8: Rerank candidates ─────────────────────────────────────────────
     println!("  ✓ Reranking {} candidates...", candidates.len());
     let rerank_start = std::time::Instant::now();
 
-    let mut reranked: Vec<(String, String, f32)> = Vec::new(); // (file_path, child_text, score)
+    let mut reranked: Vec<(String, String, f32)> = Vec::new(); // (file_path, snippet, score)
 
     for (idx, _bi_score) in &candidates {
         let chunk = &chunks[*idx];
-        // Cross-encoder input: query and the chunk text
-        // The reranker tokenizer handles the [CLS] query [SEP] passage [SEP] format internally
         let score = rerank_pair(
             &mut reranker_session,
             &reranker_tokenizer,
-            query,
-            &chunk.child_text,
+            &expanded_query, // ← expanded query for reranker
+            &chunk.parent_chunk, // ← parent chunk for rich context
             RERANKER_MAX_LEN,
         )?;
-        reranked.push((chunk.file_path.clone(), chunk.child_text.clone(), score));
+        reranked.push((
+            chunk.file_path.clone(),
+            chunk.child_text.clone(),
+            score,
+        ));
     }
 
-    // Sort by reranker score descending
     reranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     println!(
@@ -694,28 +700,28 @@ async fn search(query: &str) -> CliResult<()> {
         rerank_start.elapsed().as_secs_f32()
     );
 
-    // Deduplicate by file path — keep best reranker score per file
+    // ── Step 9: Deduplicate by file — keep best chunk per file ────────────────
+    // reranked is sorted descending so first occurrence = best chunk for that file
     let mut seen: HashSet<String> = HashSet::new();
-    let mut results: Vec<(String, f32)> = Vec::new();
+    let mut results: Vec<(String, String, f32)> = Vec::new(); // (path, snippet, score)
 
-    for (path, _text, score) in &reranked {
+    for (path, snippet, score) in &reranked {
         if seen.insert(path.clone()) {
-            results.push((path.clone(), *score));
+            results.push((path.clone(), snippet.clone(), *score));
         }
         if results.len() >= TOP_K {
             break;
         }
     }
 
-    // ── Step 9: Display results ───────────────────────────────────────────────
+    // ── Step 10: Display results ──────────────────────────────────────────────
     if results.is_empty() {
         println!("\n{}", "No results found.".yellow());
     } else {
         println!("\n{}", "Top Results:".green().bold());
         println!("{}", "============".green());
 
-        for (i, (path, score)) in results.iter().enumerate() {
-            // Reranker outputs raw logits — apply sigmoid to get 0..1
+        for (i, (path, snippet, score)) in results.iter().enumerate() {
             let sig = 1.0 / (1.0 + (-score).exp());
             let score_percent = ((sig * 100.0).clamp(0.0, 100.0) as i32) as usize;
             let bar_len = score_percent / 2;
@@ -730,14 +736,104 @@ async fn search(query: &str) -> CliResult<()> {
                 format!("{:.4}", sig).red()
             };
 
+            let preview: String = snippet.chars().take(150).collect();
+            let preview = preview.trim().replace('\n', " ");
+
             println!("\n{}. {}", i + 1, path.cyan().bold());
             println!("   Score: {} ({:.1}%)", score_colored, score_percent);
             println!("   Relevance: [{}{}]", bar, empty);
+            println!("   ↳ \"{}...\"", preview.dimmed());
         }
     }
 
     println!("\n✅ Search completed in {:.2}s", start_time.elapsed().as_secs_f32());
     Ok(())
+}
+
+// ── Query expansion — enriches short keyword queries for the reranker ─────────
+// bi-encoder uses the original query; only the reranker sees the expanded form.
+// MiniLM was trained on natural language pairs so it needs more than one word
+// to score meaningfully. We inject related terms rather than rewrite grammar.
+fn expand_query(query: &str) -> String {
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+
+    // Already natural language — leave it alone
+    if words.len() > 4
+        || q.ends_with('?')
+        || q.starts_with("how")
+        || q.starts_with("what")
+        || q.starts_with("why")
+        || q.starts_with("when")
+        || q.starts_with("where")
+    {
+        return query.trim().to_string();
+    }
+
+    let mut expanded: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+
+    for word in &words {
+        match *word {
+            "price" | "pricing" | "cost" | "fee" | "fees" | "subscription" | "plan" | "plans" => {
+                expanded.extend(["pricing", "cost", "subscription", "fee", "plan", "tier", "paid"].map(String::from));
+            }
+            "sync" | "syncing" | "synchronize" | "synchronization" | "synced" => {
+                expanded.extend(["sync", "synchronization", "update", "conflict", "offline"].map(String::from));
+            }
+            "export" | "exporting" | "download" | "backup" => {
+                expanded.extend(["export", "download", "backup", "file", "format"].map(String::from));
+            }
+            "share" | "sharing" | "collaborate" | "collaboration" | "shared" => {
+                expanded.extend(["share", "collaboration", "access", "permissions", "invite"].map(String::from));
+            }
+            "install" | "setup" | "installation" | "configure" | "configuration" => {
+                expanded.extend(["install", "setup", "installation", "getting started", "configure"].map(String::from));
+            }
+            "account" | "login" | "signin" | "password" | "auth" | "authentication" => {
+                expanded.extend(["account", "login", "authentication", "password", "sign in"].map(String::from));
+            }
+            "delete" | "remove" | "trash" | "deleted" => {
+                expanded.extend(["delete", "remove", "trash", "recover", "restore"].map(String::from));
+            }
+            "encrypt" | "encryption" | "security" | "private" | "privacy" | "secure" => {
+                expanded.extend(["encryption", "security", "private", "end-to-end", "e2e"].map(String::from));
+            }
+            "api" | "developer" | "sdk" | "integrate" | "integration" => {
+                expanded.extend(["api", "developer", "sdk", "integration", "cli", "endpoint"].map(String::from));
+            }
+            "storage" | "space" | "limit" | "quota" | "gb" | "size" => {
+                expanded.extend(["storage", "space", "quota", "limit", "gb", "capacity"].map(String::from));
+            }
+            "search" | "find" | "query" | "lookup" => {
+                expanded.extend(["search", "find", "query", "lookup", "semantic"].map(String::from));
+            }
+            "note" | "notes" | "document" | "documents" | "file" | "files" => {
+                expanded.extend(["note", "document", "file", "markdown", "text"].map(String::from));
+            }
+            "tag" | "tags" | "label" | "labels" | "folder" | "folders" => {
+                expanded.extend(["tag", "label", "folder", "organize", "category"].map(String::from));
+            }
+            "offline" | "online" | "network" | "connection" => {
+                expanded.extend(["offline", "online", "network", "connection", "internet"].map(String::from));
+            }
+            "mobile" | "android" | "ios" | "iphone" | "phone" => {
+                expanded.extend(["mobile", "android", "ios", "phone", "app"].map(String::from));
+            }
+            "desktop" | "windows" | "mac" | "linux" => {
+                expanded.extend(["desktop", "windows", "mac", "linux", "app"].map(String::from));
+            }
+            _ => {}
+        }
+    }
+
+    // Deduplicate while preserving order
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<String> = expanded
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .collect();
+
+    deduped.join(" ")
 }
 
 // ── Helper: Download E5 bi-encoder from HuggingFace ───────────────────────────
@@ -785,12 +881,6 @@ async fn ensure_model_downloaded(
 }
 
 // ── Helper: Download MiniLM reranker from HuggingFace ─────────────────────────
-//
-// Repo: cross-encoder/ms-marco-MiniLM-L-6-v2
-// ONNX version hosted by Xenova on HuggingFace.
-// model.onnx  ~85 MB
-// tokenizer.json at repo root
-//
 async fn ensure_reranker_downloaded(
     cache_dir: &Path,
     model_path: &Path,
@@ -870,12 +960,6 @@ async fn download_file(
 }
 
 // ── Helper: Score a single (query, passage) pair with the cross-encoder ────────
-//
-// The cross-encoder tokenizer encodes both strings together as:
-//   [CLS] query [SEP] passage [SEP]
-// and outputs a single logit score. Higher = more relevant.
-// Apply sigmoid externally to convert to 0..1 probability.
-//
 fn rerank_pair(
     session: &mut Session,
     tokenizer: &Tokenizer,
@@ -883,7 +967,6 @@ fn rerank_pair(
     passage: &str,
     max_len: usize,
 ) -> CliResult<f32> {
-    // Tokenize query+passage as a pair — the tokenizer inserts [SEP] between them
     let enc = tokenizer
         .encode((query, passage), true)
         .map_err(|e| CliError::from(format!("Reranker tokenization failed: {}", e)))?;
@@ -914,7 +997,6 @@ fn rerank_pair(
         ])
         .map_err(|e| CliError::from(format!("Reranker inference failed: {}", e)))?;
 
-    // Output is "logits" tensor of shape [1, 1] — a single relevance score
     let (_, logits) = outputs["logits"]
         .try_extract_tensor::<f32>()
         .map_err(|e| CliError::from(format!("Reranker extract failed: {}", e)))?;
@@ -1120,7 +1202,6 @@ fn chunk_text(text: &str, size: usize, overlap: usize, max_chunks: usize) -> Vec
     let mut chunks = Vec::new();
     let mut start = 0usize;
 
-    // Guaranteed step — always >= 1 so the loop can never hang
     let step = size.saturating_sub(overlap).max(1);
 
     while start < total && chunks.len() < max_chunks {
