@@ -8,8 +8,9 @@ mod list;
 mod migrate;
 mod share;
 mod stream;
+mod search;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use account::ApiUrl;
 use cli_rs::arg::Arg;
 use cli_rs::cli_error::{CliError, CliResult};
@@ -22,21 +23,6 @@ use lb_rs::model::core_config::Config;
 use lb_rs::model::errors::LbErrKind;
 use lb_rs::model::path_ops::Filter;
 use lb_rs::{Lb, Uuid};
-use ort::session::Session;
-use ort::session::builder::GraphOptimizationLevel;
-use ort::value::Value;
-use tokenizers::Tokenizer;
-use ort::execution_providers::CUDAExecutionProvider;
-use std::collections::{HashMap, HashSet};
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ChunkRecord {
-    file_path:    String,
-    file_name:    String,
-    parent_chunk: String,
-    child_text:   String,
-}
 
 pub async fn core() -> CliResult<Lb> {
     Lb::init(Config::cli_config("cli"))
@@ -239,9 +225,10 @@ fn run() -> CliResult<()> {
         .subcommand(
             Command::name("search").description("search document contents")
                 .input(Arg::str("query"))
-                .handler(|query| {
+                .input(Flag::bool("semantic").description("use semantic search (model-based) instead of lexical search"))
+                .handler(|query, semantic| {
                     tokio::runtime::Runtime::new().unwrap().block_on(async {
-                        search(&query.get()).await
+                        search(&query.get(), semantic.get()).await
                     })
                 })
         )
@@ -267,371 +254,82 @@ fn run() -> CliResult<()> {
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
-async fn search(query: &str) -> CliResult<()> {
+async fn search(query: &str, semantic: bool) -> CliResult<()> {
+    if semantic {
+        search::search_semantic(query).await
+    } else {
+        search_lexical(query).await
+    }
+}
+
+async fn search_lexical(query: &str) -> CliResult<()> {
     let start_time = std::time::Instant::now();
-    println!("{}", "🔍 Semantic Search".cyan().bold());
+    println!("{}", "🔎 Lexical Search".cyan().bold());
     println!("Query: {}\n", query);
+
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(CliError::from("query cannot be empty"));
+    }
 
     let lb = &core().await?;
     ensure_account_and_root(lb).await?;
 
-    const BI_HIDDEN:           usize = 1024;
-    const BI_MAX_LEN:          usize = 128;
-    const CHILD_CHARS:         usize = 512;
-    const PARENT_CHARS:        usize = 2048;
-    const CHILD_OVERLAP:       usize = 51;
-    const PARENT_OVERLAP:      usize = 205;
-    const TOP_K:               usize = 5;
-    const RERANK_K:            usize = 50;
-    const MAX_CHUNKS_PER_FILE: usize = 50_000;
-    const BATCH_SIZE:          usize = 32;
-    const RERANKER_MAX_LEN:    usize = 512;
-
-    let cache_dir = dirs::home_dir()
-        .ok_or_else(|| CliError::from("Cannot find home directory"))?
-        .join(".cache")
-        .join("lb-search")
-        .join("models");
-
-    let bi_dir          = cache_dir.join("multilingual-e5-large");
-    let model_path      = bi_dir.join("model.onnx");
-    let model_data_path = bi_dir.join("model.onnx_data");
-    let tokenizer_path  = bi_dir.join("tokenizer.json");
-
-    let reranker_dir            = cache_dir.join("ms-marco-MiniLM-L-6-v2");
-    let reranker_model_path     = reranker_dir.join("model.onnx");
-    let reranker_tokenizer_path = reranker_dir.join("tokenizer.json");
-
-    let index_dir     = Path::new("search_index");
-    let vectors_path  = index_dir.join("vectors.bin");
-    let chunks_path   = index_dir.join("chunks.json");
-    let manifest_path = index_dir.join("manifest.json");
-
-    ensure_model_downloaded(&bi_dir, &model_path, &model_data_path, &tokenizer_path).await?;
-    ensure_reranker_downloaded(&reranker_dir, &reranker_model_path, &reranker_tokenizer_path).await?;
-
-    println!("📁 Scanning files...");
     let files = lb.get_and_get_children_recursively(&lb.root().await?.id).await?;
+    let query_lower = query.to_lowercase();
+    let mut results: Vec<(String, usize, String)> = Vec::new();
 
-    let mut manifest: HashMap<String, u64> = if manifest_path.exists() {
-        let raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|_| "{}".to_string());
-        serde_json::from_str(&raw).unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
-
-    let mut current_files: Vec<(String, String, String)> = Vec::new();
     for file in &files {
-        if file.is_folder() { continue; }
+        if file.is_folder() {
+            continue;
+        }
+
         let name = file.name.to_lowercase();
-        if !name.ends_with(".txt") && !name.ends_with(".md") { continue; }
+        if !name.ends_with(".txt") && !name.ends_with(".md") {
+            continue;
+        }
 
         let content = match lb.read_document(file.id, false).await {
-            Ok(c)  => String::from_utf8_lossy(&c).to_string(),
+            Ok(c) => String::from_utf8_lossy(&c).to_string(),
             Err(_) => continue,
         };
-        if content.trim().len() < 20 { continue; }
 
-        let full_path = lb.get_path_by_id(file.id).await.unwrap_or_else(|_| file.name.clone());
-        let file_name = Path::new(&file.name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&file.name)
-            .replace(['-', '_'], " ");
+        let content_lower = content.to_lowercase();
+        let score = content_lower.match_indices(&query_lower).count();
+        if score == 0 {
+            continue;
+        }
 
-        current_files.push((full_path, file_name, content));
-    }
-
-    if current_files.is_empty() {
-        println!("No documents found. Add some .txt or .md files first.");
-        return Ok(());
-    }
-
-    let current_paths: HashSet<&str> = current_files.iter().map(|(p, _, _)| p.as_str()).collect();
-    let has_deletions  = manifest.keys().any(|p| !current_paths.contains(p.as_str()));
-    let index_exists   = vectors_path.exists() && chunks_path.exists();
-    let index_is_valid = if index_exists {
-        std::fs::read_to_string(&chunks_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
-            .map(|c| !c.is_empty())
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    let needs_full_rebuild = !index_exists || !index_is_valid || has_deletions;
-    let needs_reindex: Vec<&(String, String, String)> = if needs_full_rebuild {
-        vec![]
-    } else {
-        current_files.iter().filter(|(path, _, content)| {
-            manifest.get(path) != Some(&hash_content(content))
-        }).collect()
-    };
-
-    println!("🧠 Loading multilingual-e5-large...");
-    let load_start = std::time::Instant::now();
-
-    let mut bi_session = {
-        let builder = Session::builder()
-            .map_err(|e| CliError::from(format!("Session error: {}", e)))?;
-        let cuda    = CUDAExecutionProvider::default().build();
-        let builder = match builder.with_execution_providers([cuda]) {
-            Ok(b)  => { println!("  ✓ Using GPU acceleration"); b }
-            Err(e) => {
-                println!("  ⚠ GPU not available ({}), using CPU", e);
-                Session::builder().map_err(|e| CliError::from(format!("Session error: {}", e)))?
-            }
-        };
-        builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| CliError::from(format!("Opt error: {}", e)))?
-            .with_intra_threads(4)
-            .map_err(|e| CliError::from(format!("Thread error: {}", e)))?
-            .commit_from_file(&model_path)
-            .map_err(|e| CliError::from(format!("Model load error: {}", e)))?
-    };
-
-    let bi_tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| CliError::from(format!("Tokenizer error: {}", e)))?;
-
-    println!("  ✓ Embedder loaded in {:.2}s", load_start.elapsed().as_secs_f32());
-
-    println!("🧠 Loading reranker...");
-    let reranker_load_start = std::time::Instant::now();
-
-    let mut reranker_session = {
-        let builder = Session::builder()
-            .map_err(|e| CliError::from(format!("Reranker session error: {}", e)))?;
-        let cuda    = CUDAExecutionProvider::default().build();
-        let builder = match builder.with_execution_providers([cuda]) {
-            Ok(b)  => b,
-            Err(_) => Session::builder()
-                .map_err(|e| CliError::from(format!("Reranker session error: {}", e)))?,
-        };
-        builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| CliError::from(format!("Opt error: {}", e)))?
-            .with_intra_threads(4)
-            .map_err(|e| CliError::from(format!("Thread error: {}", e)))?
-            .commit_from_file(&reranker_model_path)
-            .map_err(|e| CliError::from(format!("Reranker load error: {}", e)))?
-    };
-
-    let reranker_tokenizer = Tokenizer::from_file(&reranker_tokenizer_path)
-        .map_err(|e| CliError::from(format!("Reranker tokenizer error: {}", e)))?;
-
-    println!("  ✓ Reranker loaded in {:.2}s", reranker_load_start.elapsed().as_secs_f32());
-
-    if needs_full_rebuild || !needs_reindex.is_empty() {
-        let (mut existing_chunks, mut existing_vectors): (Vec<ChunkRecord>, Vec<f32>) =
-            if needs_full_rebuild {
-                (Vec::new(), Vec::new())
-            } else {
-                let stale_paths: HashSet<&str> =
-                    needs_reindex.iter().map(|(p, _, _)| p.as_str()).collect();
-                let (all_chunks, all_vecs) = load_index(&chunks_path, &vectors_path, BI_HIDDEN)?;
-                let kept_vectors: Vec<f32> = all_chunks
-                    .iter()
-                    .zip(all_vecs.chunks(BI_HIDDEN))
-                    .filter(|(c, _)| !stale_paths.contains(c.file_path.as_str()))
-                    .flat_map(|(_, v)| v.iter().copied())
-                    .collect();
-                let kept_chunks: Vec<ChunkRecord> = all_chunks
-                    .into_iter()
-                    .filter(|c| !stale_paths.contains(c.file_path.as_str()))
-                    .collect();
-                (kept_chunks, kept_vectors)
-            };
-
-        let files_to_index: Vec<&(String, String, String)> = if needs_full_rebuild {
-            println!("📚 Building search index ({} files)...", current_files.len());
-            current_files.iter().collect()
-        } else {
-            println!("🔄 Updating index ({} changed files)...", needs_reindex.len());
-            needs_reindex
-        };
-
-        println!("✂️  Creating chunks...");
-        let mut new_chunks: Vec<ChunkRecord> = Vec::new();
-        let total_files = files_to_index.len();
-
-        for (file_idx, (file_path, file_name, content)) in files_to_index.iter().enumerate() {
-            {
-                use std::io::Write;
-                let pct     = ((file_idx + 1) as f32 / total_files as f32 * 100.0) as usize;
-                let bar_len = pct / 2;
-                let bar     = "█".repeat(bar_len);
-                let empty   = "░".repeat(50usize.saturating_sub(bar_len));
-                let short_name = if file_name.len() > 30 {
-                    format!("{}...", &file_name[..30])
-                } else {
-                    file_name.clone()
-                };
-                print!("\r\x1B[K  [{bar}{empty}] {}/{total_files} ({pct}%) - {short_name}", file_idx + 1);
-                let _ = std::io::stdout().flush();
-            }
-
-            let sections = split_markdown_sections(content);
-            for section in &sections {
-                let parent_chunks = chunk_text(section, PARENT_CHARS, PARENT_OVERLAP, MAX_CHUNKS_PER_FILE);
-                for parent in &parent_chunks {
-                    let child_chunks = chunk_text(parent, CHILD_CHARS, CHILD_OVERLAP, MAX_CHUNKS_PER_FILE);
-                    for child in child_chunks {
-                        if child.trim().is_empty() { continue; }
-                        new_chunks.push(ChunkRecord {
-                            file_path:    file_path.clone(),
-                            file_name:    file_name.clone(),
-                            parent_chunk: parent.clone(),
-                            child_text:   child,
-                        });
-                    }
-                }
-            }
-
-            let file_intro: String = content.chars().take(200).collect();
-            new_chunks.push(ChunkRecord {
-                file_path:    file_path.clone(),
-                file_name:    file_name.clone(),
-                parent_chunk: format!("{}\n{}", file_name, file_intro),
-                child_text:   file_name.clone(),
+        let snippet = content
+            .lines()
+            .find(|line| line.to_lowercase().contains(&query_lower))
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .unwrap_or_else(|| {
+                let preview: String = content.chars().take(150).collect();
+                preview.trim().replace('\n', " ")
             });
 
-            manifest.insert(file_path.clone(), hash_content(content));
-        }
-        println!();
+        let full_path = lb
+            .get_path_by_id(file.id)
+            .await
+            .unwrap_or_else(|_| file.name.clone());
 
-        if !new_chunks.is_empty() {
-            println!("📊 Embedding {} new chunks...", new_chunks.len());
-
-            let mut new_vectors: Vec<f32> = Vec::new();
-            let total_batches = (new_chunks.len() + BATCH_SIZE - 1) / BATCH_SIZE;
-            let embed_start   = std::time::Instant::now();
-
-            for (batch_num, batch) in new_chunks.chunks(BATCH_SIZE).enumerate() {
-                let batch_start = std::time::Instant::now();
-
-                if batch_num % 5 == 0 {
-                    use std::io::Write;
-                    print!(
-                        "\r\x1B[K  Progress: {}/{} batches ({:.0}%)",
-                        batch_num + 1, total_batches,
-                        (batch_num as f32 / total_batches as f32) * 100.0
-                    );
-                    let _ = std::io::stdout().flush();
-                }
-
-                let texts: Vec<String> = batch
-                    .iter()
-                    .map(|c| format!("{} | {}", c.file_name, c.child_text))
-                    .collect();
-
-                match embed_batch(&mut bi_session, &bi_tokenizer, &texts, BI_HIDDEN, BI_MAX_LEN) {
-                    Ok(vecs) => {
-                        let batch_ms = batch_start.elapsed().as_millis();
-                        if batch_ms > 1000 && batch_num == 0 {
-                            eprintln!("\n  ⚠ First batch took {}ms — GPU may not be active", batch_ms);
-                        }
-                        for vec in vecs { new_vectors.extend_from_slice(&vec); }
-                    }
-                    Err(e) => eprintln!("\nWarning: batch embed failed: {:?}", e),
-                }
-            }
-            println!(
-                "\r\x1B[K  ✓ Embedding done in {:.2}s ({:.0} chunks/s)",
-                embed_start.elapsed().as_secs_f32(),
-                new_chunks.len() as f32 / embed_start.elapsed().as_secs_f32()
-            );
-
-            existing_chunks.extend(new_chunks);
-            existing_vectors.extend(new_vectors);
-
-            println!("💾 Saving index...");
-            std::fs::create_dir_all(index_dir)
-                .map_err(|e| CliError::from(format!("Cannot create index dir: {}", e)))?;
-
-            let bytes: Vec<u8> = existing_vectors.iter().flat_map(|f| f.to_le_bytes()).collect();
-            std::fs::write(&vectors_path, &bytes)
-                .map_err(|e| CliError::from(format!("Cannot write vectors: {}", e)))?;
-
-            let chunks_json = serde_json::to_string(&existing_chunks)
-                .map_err(|e| CliError::from(format!("Cannot serialize chunks: {}", e)))?;
-            std::fs::write(&chunks_path, chunks_json)
-                .map_err(|e| CliError::from(format!("Cannot write chunks: {}", e)))?;
-
-            manifest.retain(|p, _| current_paths.contains(p.as_str()));
-            let manifest_json = serde_json::to_string(&manifest)
-                .map_err(|e| CliError::from(format!("Cannot serialize manifest: {}", e)))?;
-            std::fs::write(&manifest_path, manifest_json)
-                .map_err(|e| CliError::from(format!("Cannot write manifest: {}", e)))?;
-
-            println!("  ✓ Index saved ({} total chunks)", existing_chunks.len());
-        }
-    } else {
-        println!("📖 Index is up to date, loading...");
+        results.push((full_path, score, snippet));
     }
 
-    let (chunks, vectors) = load_index(&chunks_path, &vectors_path, BI_HIDDEN)?;
-    let num_chunks = chunks.len();
-    if num_chunks == 0 {
-        println!("No documents indexed yet.");
-        return Ok(());
-    }
-    println!("  ✓ Loaded {} chunks", num_chunks);
-
-    println!("🔎 Searching...");
-    let query_vec = embed_single(&mut bi_session, &bi_tokenizer, query, "query", BI_HIDDEN, BI_MAX_LEN)?;
-
-    let mut scores: Vec<(usize, f32)> = (0..num_chunks)
-        .map(|i| {
-            let base = i * BI_HIDDEN;
-            let sim: f32 = (0..BI_HIDDEN).map(|j| query_vec[j] * vectors[base + j]).sum();
-            (i, sim)
-        })
-        .collect();
-
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let candidates: Vec<(usize, f32)> = scores.into_iter().take(RERANK_K).collect();
-
-    println!("  ✓ Reranking {} candidates...", candidates.len());
-    let rerank_start = std::time::Instant::now();
-    let mut reranked: Vec<(String, String, f32)> = Vec::new();
-
-    for (idx, _) in &candidates {
-        let chunk = &chunks[*idx];
-        let score = rerank_pair(&mut reranker_session, &reranker_tokenizer, query, &chunk.parent_chunk, RERANKER_MAX_LEN)?;
-        reranked.push((chunk.file_path.clone(), chunk.child_text.clone(), score));
-    }
-
-    reranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    println!("  ✓ Reranking done in {:.2}s", rerank_start.elapsed().as_secs_f32());
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut results: Vec<(String, String, f32)> = Vec::new();
-    for (path, snippet, score) in &reranked {
-        if seen.insert(path.clone()) { results.push((path.clone(), snippet.clone(), *score)); }
-        if results.len() >= TOP_K { break; }
-    }
+    results.sort_by(|a, b| b.1.cmp(&a.1));
 
     if results.is_empty() {
         println!("\n{}", "No results found.".yellow());
     } else {
         println!("\n{}", "Top Results:".green().bold());
         println!("{}", "============".green());
-        for (i, (path, snippet, score)) in results.iter().enumerate() {
-            let sig           = 1.0f32 / (1.0 + (-score).exp());
-            let score_percent = (sig * 100.0).clamp(0.0, 100.0) as usize;
-            let bar_len       = score_percent / 2;
-            let bar           = "█".repeat(bar_len);
-            let empty         = "░".repeat(50usize.saturating_sub(bar_len));
-            let score_colored = if sig > 0.7 { format!("{:.4}", sig).green() }
-                                else if sig > 0.4 { format!("{:.4}", sig).yellow() }
-                                else { format!("{:.4}", sig).red() };
+
+        for (i, (path, score, snippet)) in results.iter().take(10).enumerate() {
             let preview: String = snippet.chars().take(150).collect();
-            let preview = preview.trim().replace('\n', " ");
             println!("\n{}. {}", i + 1, path.cyan().bold());
-            println!("   Score: {} ({:.1}%)", score_colored, score_percent);
-            println!("   Relevance: [{}{}]", bar, empty);
+            println!("   Matches: {}", score.to_string().yellow());
             println!("   ↳ \"{}...\"", preview.dimmed());
         }
     }
@@ -640,346 +338,7 @@ async fn search(query: &str) -> CliResult<()> {
     Ok(())
 }
 
-// ── Model downloaders ─────────────────────────────────────────────────────────
 
-async fn ensure_model_downloaded(
-    cache_dir: &Path,
-    model_path: &Path,
-    model_data_path: &Path,
-    tokenizer_path: &Path,
-) -> CliResult<()> {
-    if model_path.exists() && model_data_path.exists() && tokenizer_path.exists() {
-        return Ok(());
-    }
-
-    println!("📥 Downloading multilingual-e5-large from Hugging Face...");
-    println!("   This is a 2.1GB model — only downloaded once.");
-
-    std::fs::create_dir_all(cache_dir)
-        .map_err(|e| CliError::from(format!("Cannot create cache dir: {}", e)))?;
-
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| CliError::from(format!("HTTP client error: {}", e)))?;
-
-    if !model_path.exists() {
-        download_file(
-            &client,
-            "https://huggingface.co/Xenova/multilingual-e5-large/resolve/main/onnx/model.onnx",
-            model_path,
-            "model.onnx",
-        ).await?;
-    }
-    if !model_data_path.exists() {
-        download_file(
-            &client,
-            "https://huggingface.co/Xenova/multilingual-e5-large/resolve/main/onnx/model.onnx_data",
-            model_data_path,
-            "model.onnx_data (~2.1GB)",
-        ).await?;
-    }
-    if !tokenizer_path.exists() {
-        download_file(
-            &client,
-            "https://huggingface.co/Xenova/multilingual-e5-large/resolve/main/tokenizer.json",
-            tokenizer_path,
-            "tokenizer.json",
-        ).await?;
-    }
-
-    println!("  ✓ multilingual-e5-large ready");
-    Ok(())
-}
-
-async fn ensure_reranker_downloaded(
-    cache_dir: &Path,
-    model_path: &Path,
-    tokenizer_path: &Path,
-) -> CliResult<()> {
-    if model_path.exists() && tokenizer_path.exists() {
-        return Ok(());
-    }
-
-    println!("📥 Downloading reranker model from Hugging Face...");
-
-    std::fs::create_dir_all(cache_dir)
-        .map_err(|e| CliError::from(format!("Cannot create reranker cache dir: {}", e)))?;
-
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| CliError::from(format!("HTTP client error: {}", e)))?;
-
-    if !model_path.exists() {
-        download_file(
-            &client,
-            "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx",
-            model_path,
-            "reranker model.onnx",
-        ).await?;
-    }
-    if !tokenizer_path.exists() {
-        download_file(
-            &client,
-            "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json",
-            tokenizer_path,
-            "reranker tokenizer.json",
-        ).await?;
-    }
-
-    println!("  ✓ Reranker model ready");
-    Ok(())
-}
-
-async fn download_file(client: &reqwest::Client, url: &str, dest: &Path, label: &str) -> CliResult<()> {
-    println!("   Downloading {}...", label);
-    let resp = client.get(url).send().await
-        .map_err(|e| CliError::from(format!("Request failed for {}: {}", label, e)))?;
-
-    if !resp.status().is_success() {
-        return Err(CliError::from(format!("HTTP {} downloading {}", resp.status().as_u16(), label)));
-    }
-
-    let bytes = resp.bytes().await
-        .map_err(|e| CliError::from(format!("Read failed for {}: {}", label, e)))?;
-
-    std::fs::write(dest, &bytes)
-        .map_err(|e| CliError::from(format!("Write failed for {}: {}", label, e)))?;
-
-    println!("  ✓ {} saved ({:.1} MB)", label, bytes.len() as f64 / 1_048_576.0);
-    Ok(())
-}
-
-// ── Reranker ──────────────────────────────────────────────────────────────────
-
-fn rerank_pair(
-    session:   &mut Session,
-    tokenizer: &Tokenizer,
-    query:     &str,
-    passage:   &str,
-    max_len:   usize,
-) -> CliResult<f32> {
-    let enc = tokenizer.encode((query, passage), true)
-        .map_err(|e| CliError::from(format!("Reranker tokenization failed: {}", e)))?;
-
-    let ids   = enc.get_ids();
-    let mask  = enc.get_attention_mask();
-    let types = enc.get_type_ids();
-    let len   = ids.len().min(max_len);
-
-    let mut padded_ids   = vec![0i64; max_len];
-    let mut padded_mask  = vec![0i64; max_len];
-    let mut padded_types = vec![0i64; max_len];
-
-    for i in 0..len {
-        padded_ids[i]   = ids[i]   as i64;
-        padded_mask[i]  = mask[i]  as i64;
-        padded_types[i] = types[i] as i64;
-    }
-
-    let outputs = session.run(ort::inputs![
-        "input_ids"      => Value::from_array(([1usize, max_len], padded_ids))
-            .map_err(|e| CliError::from(format!("Tensor error: {}", e)))?,
-        "attention_mask" => Value::from_array(([1usize, max_len], padded_mask))
-            .map_err(|e| CliError::from(format!("Tensor error: {}", e)))?,
-        "token_type_ids" => Value::from_array(([1usize, max_len], padded_types))
-            .map_err(|e| CliError::from(format!("Tensor error: {}", e)))?,
-    ]).map_err(|e| CliError::from(format!("Reranker inference failed: {}", e)))?;
-
-    let (_, logits) = outputs["logits"].try_extract_tensor::<f32>()
-        .map_err(|e| CliError::from(format!("Reranker extract failed: {}", e)))?;
-
-    Ok(logits[0])
-}
-
-// ── Index ─────────────────────────────────────────────────────────────────────
-
-fn load_index(chunks_path: &Path, vectors_path: &Path, hidden: usize) -> CliResult<(Vec<ChunkRecord>, Vec<f32>)> {
-    let chunks_raw = std::fs::read_to_string(chunks_path)
-        .map_err(|e| CliError::from(format!("Cannot read chunks: {}", e)))?;
-    let chunks: Vec<ChunkRecord> = serde_json::from_str(&chunks_raw)
-        .map_err(|e| CliError::from(format!("Invalid chunks: {}", e)))?;
-
-    let vector_bytes = std::fs::read(vectors_path)
-        .map_err(|e| CliError::from(format!("Cannot read vectors: {}", e)))?;
-
-    if vector_bytes.len() % 4 != 0 {
-        return Err(CliError::from("Corrupted vectors file"));
-    }
-
-    let vectors: Vec<f32> = vector_bytes.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-
-    if vectors.len() != chunks.len() * hidden {
-        return Err(CliError::from("Index mismatch: delete search_index/ and re-run."));
-    }
-
-    Ok((chunks, vectors))
-}
-
-// ── Embedding ─────────────────────────────────────────────────────────────────
-
-fn embed_batch(
-    session:   &mut Session,
-    tokenizer: &Tokenizer,
-    texts:     &[String],
-    hidden:    usize,
-    max_len:   usize,
-) -> CliResult<Vec<Vec<f32>>> {
-    let batch_size = texts.len();
-    if batch_size == 0 { return Ok(vec![]); }
-
-    let mut all_ids   = vec![0i64; batch_size * max_len];
-    let mut all_mask  = vec![0i64; batch_size * max_len];
-    let mut lengths   = vec![0usize; batch_size];
-
-    for (b, text) in texts.iter().enumerate() {
-        let prefixed = format!("passage: {}", text);
-        let enc = tokenizer.encode(prefixed.as_str(), true)
-            .map_err(|e| CliError::from(format!("Tokenization failed: {}", e)))?;
-
-        let ids   = enc.get_ids();
-        let mask  = enc.get_attention_mask();
-        let len   = ids.len().min(max_len);
-        lengths[b] = len;
-
-        let offset = b * max_len;
-        for i in 0..len {
-            all_ids[offset + i]   = ids[i]   as i64;
-            all_mask[offset + i]  = mask[i]  as i64;
-        }
-    }
-
-    // Fixed: removed token_type_ids (multilingual-e5-large doesn't use them)
-    let outputs = session.run(ort::inputs![
-        "input_ids"      => Value::from_array(([batch_size, max_len], all_ids))
-            .map_err(|e| CliError::from(format!("Tensor error: {}", e)))?,
-        "attention_mask" => Value::from_array(([batch_size, max_len], all_mask))
-            .map_err(|e| CliError::from(format!("Tensor error: {}", e)))?,
-    ]).map_err(|e| CliError::from(format!("Inference failed: {}", e)))?;
-
-    let (_, emb) = outputs["last_hidden_state"].try_extract_tensor::<f32>()
-        .map_err(|e| CliError::from(format!("Extract failed: {}", e)))?;
-
-    let mut results = Vec::with_capacity(batch_size);
-    for b in 0..batch_size {
-        let len = lengths[b];
-        let mut pooled = vec![0.0f32; hidden];
-        for i in 0..len {
-            let base = b * max_len * hidden + i * hidden;
-            for j in 0..hidden { pooled[j] += emb[base + j]; }
-        }
-        if len > 0 { for v in &mut pooled { *v /= len as f32; } }
-        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 1e-9 { for v in &mut pooled { *v /= norm; } }
-        results.push(pooled);
-    }
-
-    Ok(results)
-}
-
-fn embed_single(
-    session:   &mut Session,
-    tokenizer: &Tokenizer,
-    text:      &str,
-    prefix:    &str,
-    hidden:    usize,
-    max_len:   usize,
-) -> CliResult<Vec<f32>> {
-    let prefixed = format!("{}: {}", prefix, text);
-    let enc = tokenizer.encode(prefixed.as_str(), true)
-        .map_err(|e| CliError::from(format!("Tokenization failed: {}", e)))?;
-
-    let ids   = enc.get_ids();
-    let mask  = enc.get_attention_mask();
-    let qlen  = ids.len().min(max_len);
-
-    let mut padded_ids   = vec![0i64; max_len];
-    let mut padded_mask  = vec![0i64; max_len];
-
-    for i in 0..qlen {
-        padded_ids[i]   = ids[i]   as i64;
-        padded_mask[i]  = mask[i]  as i64;
-    }
-
-    // Fixed: removed token_type_ids (multilingual-e5-large doesn't use them)
-    let outputs = session.run(ort::inputs![
-        "input_ids"      => Value::from_array(([1usize, max_len], padded_ids))
-            .map_err(|e| CliError::from(format!("Tensor error: {}", e)))?,
-        "attention_mask" => Value::from_array(([1usize, max_len], padded_mask))
-            .map_err(|e| CliError::from(format!("Tensor error: {}", e)))?,
-    ]).map_err(|e| CliError::from(format!("Inference failed: {}", e)))?;
-
-    let (_, q_emb) = outputs["last_hidden_state"].try_extract_tensor::<f32>()
-        .map_err(|e| CliError::from(format!("Extract failed: {}", e)))?;
-
-    let mut vec = vec![0.0f32; hidden];
-    for i in 0..qlen {
-        let base = i * hidden;
-        for j in 0..hidden { vec[j] += q_emb[base + j]; }
-    }
-    if qlen > 0 { for v in &mut vec { *v /= qlen as f32; } }
-    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-9 { for v in &mut vec { *v /= norm; } }
-
-    Ok(vec)
-}
-
-// ── Text utilities ────────────────────────────────────────────────────────────
-
-fn split_markdown_sections(text: &str) -> Vec<String> {
-    let mut sections: Vec<String> = Vec::new();
-    let mut current = String::new();
-
-    for line in text.lines() {
-        if line.starts_with('#') && !current.trim().is_empty() {
-            sections.push(current.trim().to_string());
-            current = String::new();
-        }
-        current.push_str(line);
-        current.push('\n');
-    }
-
-    if !current.trim().is_empty() {
-        sections.push(current.trim().to_string());
-    }
-    if sections.is_empty() {
-        sections.push(text.trim().to_string());
-    }
-
-    sections
-}
-
-fn chunk_text(text: &str, size: usize, overlap: usize, max_chunks: usize) -> Vec<String> {
-    let chars: Vec<char> = text.trim().chars().collect();
-    let total = chars.len();
-
-    if total == 0 { return vec![]; }
-    if total <= size { return vec![chars.iter().collect()]; }
-
-    let mut chunks = Vec::new();
-    let mut start  = 0usize;
-    let step       = size.saturating_sub(overlap).max(1);
-
-    while start < total && chunks.len() < max_chunks {
-        let end   = (start + size).min(total);
-        let chunk: String = chars[start..end].iter().collect();
-        let chunk = chunk.trim().to_string();
-        if !chunk.is_empty() { chunks.push(chunk); }
-        if end >= total { break; }
-        start += step;
-    }
-
-    chunks
-}
-
-fn hash_content(content: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    content.hash(&mut h);
-    h.finish()
-}
 
 // ── Other commands ────────────────────────────────────────────────────────────
 
