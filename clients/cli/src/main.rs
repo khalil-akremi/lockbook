@@ -289,9 +289,16 @@ async fn search_lexical(query: &str) -> CliResult<()> {
             continue;
         }
 
+        println!("  Reading document id={} name={}", file.id, file.name);
         let content = match lb.read_document(file.id, false).await {
-            Ok(c) => String::from_utf8_lossy(&c).to_string(),
-            Err(_) => continue,
+            Ok(c) => {
+                println!("    read {} bytes", c.len());
+                String::from_utf8_lossy(&c).to_string()
+            }
+            Err(e) => {
+                eprintln!("    read_document error for {}: {:?}", file.id, e);
+                continue
+            }
         };
 
         let content_lower = content.to_lowercase();
